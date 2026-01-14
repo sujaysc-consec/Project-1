@@ -9,11 +9,16 @@ import concurrent.futures
 
 DB_NAME = 'ledger.db'
 
-# We will use a ThreadPoolExecutor for blocking DB operations
-# SQLite handles concurrent reads well in WAL mode, but writes lock.
-# A single-threaded writer is often safer/faster for SQLite than concurrent writers fighting for lock.
-# However, for this assessment, a default pool is fine.
-db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+read_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
 
 # --- Database Setup (Do not modify this setup logic) ---
 def init_db():
@@ -41,7 +46,8 @@ init_db()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    db_executor.shutdown()
+    read_executor.shutdown()
+    write_executor.shutdown()
 
 app = FastAPI(title="Ledger API", lifespan=lifespan)
 
@@ -115,8 +121,12 @@ async def search_users(q: str = Query(..., min_length=1, description="Username t
     """
     loop = asyncio.get_running_loop()
     try:
-        # Run the synchronous function in the executor
-        results = await loop.run_in_executor(db_executor, run_query_sync, "SELECT id, username, role FROM users WHERE username = ?", (q,))
+        results = await loop.run_in_executor(
+            read_executor,
+            run_query_sync,
+            "SELECT id, username, role FROM users WHERE username = ?",
+            (q,),
+        )
         
         users = [
             UserResponse(id=r['id'], username=r['username'], role=r['role']) 
@@ -140,7 +150,7 @@ async def process_transaction(transaction: TransactionRequest):
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(
-            db_executor, 
+            write_executor,
             run_transaction_sync, 
             transaction.user_id, 
             transaction.amount
