@@ -68,43 +68,33 @@ class TransactionResponse(BaseModel):
 # --- DB Helpers (The "Bridge" to Async) ---
 
 def run_query_sync(query: str, params: tuple = ()) -> List[dict]:
-    """Blocking function to run a read query."""
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = connect_db()
     cursor = conn.cursor()
     try:
         cursor.execute(query, params)
         results = cursor.fetchall()
-        # Convert Row objects to dicts so they can be passed back safely
         return [dict(row) for row in results]
     finally:
         conn.close()
 
 def run_transaction_sync(user_id: int, amount: float) -> float:
-    """Blocking function to execute the transaction logic atomically."""
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
+    conn = connect_db()
     cursor = conn.cursor()
     try:
-        # Start transaction (implicit in standard python sqlite3 for DML)
-        # 1. Check Balance
+        cursor.execute(
+            "UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?",
+            (amount, user_id, amount),
+        )
+        if cursor.rowcount != 1:
+            cursor.execute("SELECT 1 FROM users WHERE id = ?", (user_id,))
+            if cursor.fetchone() is None:
+                raise ValueError("User not found")
+            raise ValueError("Insufficient funds")
+
         cursor.execute("SELECT balance FROM users WHERE id = ?", (user_id,))
         row = cursor.fetchone()
-        
-        if not row:
-            raise ValueError("User not found")
-            
-        current_balance = row['balance']
-        
-        if current_balance < amount:
-            raise ValueError("Insufficient funds")
-        
-        # 2. Update Balance
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (amount, user_id))
-        
         conn.commit()
-        return current_balance - amount
-        
+        return float(row["balance"]) if row is not None else 0.0
     except Exception:
         conn.rollback()
         raise
