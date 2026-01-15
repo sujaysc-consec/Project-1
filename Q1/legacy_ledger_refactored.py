@@ -2,23 +2,14 @@ import sqlite3
 import asyncio
 from typing import List, Optional, Any
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import concurrent.futures
 
 
-DB_NAME = 'ledger.db'
-
 read_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
 
 # --- Database Setup (Do not modify this setup logic) ---
 def init_db():
@@ -51,24 +42,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ledger API", lifespan=lifespan)
 
+
 # --- Pydantic Models ---
 class UserResponse(BaseModel):
     id: int
     username: str
     role: str
 
-class TransactionRequest(BaseModel):
-    user_id: int = Field(..., gt=0, description="The ID of the user")
-    amount: float = Field(..., gt=0, description="Amount to deduct")
-
-class TransactionResponse(BaseModel):
-    status: str
-    deducted: float
 
 # --- DB Helpers (The "Bridge" to Async) ---
 
 def run_query_sync(query: str, params: tuple = ()) -> List[dict]:
-    conn = connect_db()
+    conn = sqlite3.connect('ledger.db')
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     try:
         cursor.execute(query, params)
@@ -78,7 +64,8 @@ def run_query_sync(query: str, params: tuple = ()) -> List[dict]:
         conn.close()
 
 def run_transaction_sync(user_id: int, amount: float) -> float:
-    conn = connect_db()
+    conn = sqlite3.connect('ledger.db')
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     try:
         cursor.execute(
@@ -103,12 +90,17 @@ def run_transaction_sync(user_id: int, amount: float) -> float:
 
 # --- Routes ---
 
-@app.get('/search', response_model=List[UserResponse])
-async def search_users(q: str = Query(..., min_length=1, description="Username to search for")):
+@app.get('/search')
+async def search_users(q: str | None = Query(default=None)):
     """
     Search for a user by username.
-    Offloads blocking SQLite call to a thread pool.
+    Compatible with legacy behavior:
+    - Missing q -> 400 {"error": "Missing query parameter"}
+    - Errors -> 500 {"error": "..."}
     """
+    if not q:
+        return JSONResponse(status_code=400, content={"error": "Missing query parameter"})
+
     loop = asyncio.get_running_loop()
     try:
         results = await loop.run_in_executor(
@@ -117,51 +109,40 @@ async def search_users(q: str = Query(..., min_length=1, description="Username t
             "SELECT id, username, role FROM users WHERE username = ?",
             (q,),
         )
-        
-        users = [
-            UserResponse(id=r['id'], username=r['username'], role=r['role']) 
-            for r in results
-        ]
-        return users
+        return [{"id": r["id"], "username": r["username"], "role": r["role"]} for r in results]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.post('/transaction', response_model=TransactionResponse)
-async def process_transaction(transaction: TransactionRequest):
+@app.post('/transaction')
+async def process_transaction(request: Request):
     """
     Deducts money from a user's balance.
-    Mixes Async (sleep) with Threaded (sqlite) execution.
+    Compatible with legacy behavior:
+    - Invalid input -> 400 {"error": "Invalid input"}
+    - Errors -> 500 {"error": "..."}
     """
-    
-    # 1. Non-blocking delay (Simulate Banking Core)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid input"})
+
+    if not isinstance(data, dict):
+        return JSONResponse(status_code=400, content={"error": "Invalid input"})
+
+    user_id = data.get("user_id")
+    amount = data.get("amount")
+
+    if not user_id or not amount:
+        return JSONResponse(status_code=400, content={"error": "Invalid input"})
+
     await asyncio.sleep(3)
-    
-    # 2. Blocking DB Transaction (Run in Thread)
+
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            write_executor,
-            run_transaction_sync, 
-            transaction.user_id, 
-            transaction.amount
-        )
-        
-        return TransactionResponse(
-            status="processed", 
-            deducted=transaction.amount
-        )
-        
-    except ValueError as e:
-        # Map our custom errors to HTTP status codes
-        msg = str(e)
-        if "User not found" in msg:
-            raise HTTPException(status_code=404, detail=msg)
-        elif "Insufficient funds" in msg:
-            raise HTTPException(status_code=400, detail=msg)
-        else:
-            raise HTTPException(status_code=500, detail=msg)
+        await loop.run_in_executor(write_executor, run_transaction_sync, int(user_id), float(amount))
+        return {"status": "processed", "deducted": amount}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == '__main__':
     import uvicorn
