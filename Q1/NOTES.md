@@ -8,12 +8,13 @@
 Queries now use the `?` placeholder (e.g., `execute("... WHERE username = ?", (q,))`). This ensures the database treats input strictly as data, neutralizing injection attacks.
 
 ### 2. Data Integrity
-**Issue**: 
-- Updates were not atomic (potential partial writes).
-- No check for sufficient funds (could result in negative balance).
-**Fix**: 
-- **Atomic Transactions**: Leveraged SQLite's transaction support with explicit `commit()` and `rollback()` on error.
-- **Validation**: Added logic to verify `balance >= amount` before deducting.
+**Issue**:
+- Transaction updates were built via string interpolation and did not enforce any guardrails (easy to corrupt data or deduct unintended amounts).
+
+**Fix**:
+- **Parameterized UPDATE**: Uses `UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?` to prevent SQL injection and ensure the update happens as a single atomic statement.
+- **Commit/Rollback**: Commits on success and rolls back on any exception to avoid leaving the DB in a bad state.
+- **Serialized Writes**: Runs all write transactions through a single-worker thread pool to avoid concurrent write contention in SQLite.
 
 ## Performance Solution
 
@@ -22,11 +23,10 @@ Queries now use the `?` placeholder (e.g., `execute("... WHERE username = ?", (q
 **Requirement**: API must remain responsive despite 3s delay.
 
 **Solution**:
-1.  **FastAPI + Asyncio**: The web server handles requests asynchronously.
-2.  **Non-Blocking Delay**: Replaced `time.sleep` with `await asyncio.sleep`. This yields control to the event loop, allowing thousands of requests to be processed while waiting for the "banking core."
-3.  **Thread Pool for Database**: Since `sqlite3` is blocking, I wrapped all database operations in `loop.run_in_executor`. This offloads the file I/O to a thread pool, preventing it from blocking the main async event loop.
-4.  **WAL Mode**: Enabled `PRAGMA journal_mode=WAL` to allow readers (Search) and writers (Transaction) to operate concurrently without locking the entire file.
-5.  **Indexing**: Added an index on `username` to ensure O(1) lookup times.
+1.  **FastAPI + Asyncio**: The server uses an async event loop to keep request handling responsive.
+2.  **Non-Blocking Delay**: Replaced `time.sleep(3)` with `await asyncio.sleep(3)`, so one slow transaction doesn’t block other requests.
+3.  **Thread Pool for Database**: Because `sqlite3` is blocking, DB work runs in `loop.run_in_executor`.
+4.  **Separate Pools**: Reads use a small thread pool; writes use a single-worker thread pool to keep updates safe and avoid SQLite write-lock contention.
 
 ## How to Run
 
@@ -40,6 +40,8 @@ Queries now use the `?` placeholder (e.g., `execute("... WHERE username = ?", (q
     python legacy_ledger_refactored.py
     ```
     (Runs on port 5001)
+
+    Note: `test_app.py` is configured to call `http://127.0.0.1:5001`.
 
 3.  **Run Tests**:
     ```bash
